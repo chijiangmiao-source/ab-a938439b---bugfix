@@ -2,7 +2,6 @@
 
 const MAX_STATIONS = 12;
 const MAX_PIPES = 36;
-const MAX_SAFE_WIRE_INTEGER = BigInt(Number.MAX_SAFE_INTEGER);
 
 const stationBody = document.querySelector("#stationTable tbody");
 const pipeBody = document.querySelector("#pipeTable tbody");
@@ -87,23 +86,129 @@ function renderCounter() {
 }
 
 // ------------------------------------------------------------ 构造请求
+const INT_RE = /^[+-]?\d+$/;
 function parseExactInteger(v, loc) {
   const text = String(v ?? "").trim();
-  if (!/^[+-]?\d+$/.test(text)) {
+  if (!INT_RE.test(text)) {
     throw { loc, message: "必须是整数" };
   }
   return BigInt(text);
 }
 
+// 小整数走 JSON number（语义不变）；超出 JS 安全整数范围时以严格十进制
+// 字符串上送——后端把它按任意精度整数解析，绝不经过 Number 丢精度。
+const SAFE_MAX = BigInt(Number.MAX_SAFE_INTEGER);
+const SAFE_MIN = -SAFE_MAX;
 function toWireInteger(exact) {
-  if (exact > MAX_SAFE_WIRE_INTEGER || exact < -MAX_SAFE_WIRE_INTEGER) {
-    return exact.toString();
-  }
+  if (exact > SAFE_MAX || exact < SAFE_MIN) return exact.toString();
   return Number(exact);
 }
 
 function safeInt(v, loc) {
   return toWireInteger(parseExactInteger(v, loc));
+}
+
+// ------------------------------------------------------------ 无损 JSON 解析
+// 后端可能返回远超 Number.MAX_SAFE_INTEGER 的精确整数（如 10^24 总成本）。
+// 标准 JSON.parse 会丢精度，故自行做递归下降：所有整数字面量解析为 BigInt，
+// 浮点仍为 Number（本服务不应产生浮点），字符串/布尔/null 保持原样。
+function parseJsonLossless(text) {
+  let i = 0;
+  const n = text.length;
+  function ws() { while (i < n && " \t\r\n".includes(text[i])) i++; }
+  function value() {
+    ws();
+    const c = text[i];
+    if (c === "{") return object();
+    if (c === "[") return array();
+    if (c === '"') return string();
+    if (c === "t" || c === "f") return boolean();
+    if (c === "n") return nullLit();
+    return number();
+  }
+  function object() {
+    const o = {};
+    i++; ws();
+    if (text[i] === "}") { i++; return o; }
+    while (true) {
+      ws();
+      const k = string();
+      ws();
+      if (text[i] !== ":") throw new Error("JSON 解析失败：缺 ':'");
+      i++;
+      o[k] = value();
+      ws();
+      if (text[i] === ",") { i++; continue; }
+      if (text[i] === "}") { i++; break; }
+      throw new Error("JSON 解析失败：对象内缺 ',' 或 '}'");
+    }
+    return o;
+  }
+  function array() {
+    const a = [];
+    i++; ws();
+    if (text[i] === "]") { i++; return a; }
+    while (true) {
+      a.push(value());
+      ws();
+      if (text[i] === ",") { i++; continue; }
+      if (text[i] === "]") { i++; break; }
+      throw new Error("JSON 解析失败：数组内缺 ',' 或 ']'");
+    }
+    return a;
+  }
+  function string() {
+    let out = "";
+    i++;
+    while (i < n) {
+      const c = text[i++];
+      if (c === '"') return out;
+      if (c === "\\") {
+        const e = text[i++];
+        if (e === "u") {
+          out += String.fromCharCode(parseInt(text.slice(i, i + 4), 16));
+          i += 4;
+        } else {
+          out += { '"': '"', "\\": "\\", "/": "/", b: "\b",
+                   f: "\f", n: "\n", r: "\r", t: "\t" }[e] ?? e;
+        }
+      } else {
+        out += c;
+      }
+    }
+    throw new Error("JSON 解析失败：字符串未闭合");
+  }
+  function boolean() {
+    if (text.startsWith("true", i)) { i += 4; return true; }
+    if (text.startsWith("false", i)) { i += 5; return false; }
+    throw new Error("JSON 解析失败：非法字面量");
+  }
+  function nullLit() {
+    if (text.startsWith("null", i)) { i += 4; return null; }
+    throw new Error("JSON 解析失败：非法字面量");
+  }
+  function number() {
+    const start = i;
+    if (text[i] === "-") i++;
+    while (i < n && /[0-9]/.test(text[i])) i++;
+    let isFloat = false;
+    if (text[i] === ".") {
+      isFloat = true; i++;
+      while (i < n && /[0-9]/.test(text[i])) i++;
+    }
+    if (text[i] === "e" || text[i] === "E") {
+      isFloat = true; i++;
+      if (text[i] === "+" || text[i] === "-") i++;
+      while (i < n && /[0-9]/.test(text[i])) i++;
+    }
+    const lit = text.slice(start, i);
+    if (!lit) throw new Error("JSON 解析失败：非法数值");
+    return isFloat ? Number(lit) : BigInt(lit);
+  }
+  const r = value();
+  ws();
+  if (i < n) throw new Error("JSON 解析失败：尾部多余字符");
+  return r;
 }
 
 function buildPayload() {
@@ -141,7 +246,11 @@ function buildPayload() {
 }
 
 // ------------------------------------------------------------ 渲染结果
-function rcClass(rc) { return rc < 0 ? "rc-neg" : rc === 0 ? "rc-zero" : "rc-pos"; }
+function rcClass(rc) {
+  if (rc < 0) return "rc-neg";
+  if (rc === 0 || rc === 0n) return "rc-zero";
+  return "rc-pos";
+}
 
 function renderOptimal(r) {
   const boxes = el("div", { class: "kv" },
@@ -248,7 +357,14 @@ async function submit() {
     const resp = await fetch("/api/solve", {
       method: "POST", headers, body: JSON.stringify(payload),
     });
-    const data = await resp.json();
+    const rawText = await resp.text();
+    let data;
+    try {
+      data = parseJsonLossless(rawText);  // 大整数以 BigInt 无损保留
+    } catch (e) {
+      showResult("invalid", { error: `响应解析失败: ${e}`, loc: "$" });
+      return;
+    }
     if (resp.status === 400) {
       showResult("invalid", { error: data.error, loc: data.loc });
       return;

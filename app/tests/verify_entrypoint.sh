@@ -4,11 +4,18 @@ set -e
 
 WEB_URL="${WEB_URL:-http://web:8080}"
 
-echo "== [verify] stage 1/2: 求解器与 API 单元测试（镜像内执行）=="
+echo "== [verify] stage 1/3: 求解器与 API 单元测试（镜像内执行）=="
 cd /app 2>/dev/null || cd "$(dirname "$0")/.."
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 
-echo "== [verify] stage 2/2: 本题 API 冒烟 -> ${WEB_URL} =="
+if command -v node >/dev/null 2>&1; then
+  echo "== [verify] stage 2/3: 前端无损整数通道（BigInt 解析/上送）=="
+  node tests/test_frontend_lossless.js
+else
+  echo "== [verify] stage 2/3: 镜像内无 Node，跳过前端 JS 通道测试 =="
+fi
+
+echo "== [verify] stage 3/3: 本题 API 冒烟 -> ${WEB_URL} =="
 python3 tests/smoke.py "${WEB_URL}"
 
 echo "== [verify] 全部通过，verify 容器正常退出 (exit 0) =="

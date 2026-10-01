@@ -15,11 +15,16 @@ import os
 import threading
 from typing import Any, Dict, Optional
 
-_FP_PREFIX = "﻿fp-v1"  # 防止 {"a":1} 与 {"a":"1"} 之类的键序碰撞
+from solver import normalize_for_fingerprint
+
+_FP_PREFIX = "fp-v2"  # v2: 整数字符串与整数按数值等价归一化
 
 
 def fingerprint(payload: Any) -> str:
-    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+    # 归一化后再取规范化 JSON：123 与 "123"（页面大整数的两种无损写法）
+    # 视为同一载荷，保证同标识数值等价重传稳定命中原记录。
+    canonical = json.dumps(normalize_for_fingerprint(payload),
+                           ensure_ascii=False, sort_keys=True,
                            separators=(",", ":"))
     return hashlib.sha256((_FP_PREFIX + canonical).encode("utf-8")).hexdigest()
 

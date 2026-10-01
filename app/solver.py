@@ -16,12 +16,18 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 MAX_STATIONS = 12
 MAX_PIPES = 36
 INF = 10 ** 30  # 仅作哨兵，绝不进入结果
+
+# 严格十进制整数字面量（可选符号 + 数字），用于接收页面以字符串形式
+# 无损传输的超大整数；浮点（1.5）、科学计数（1e18）等一律不接受。
+# 用 \Z 而非 $ 收尾，避免 "123\n" 之类尾随换行被误判。
+_INT_LITERAL_RE = re.compile(r"[+-]?\d{1,64}\Z")
 
 
 class ValidationError(Exception):
@@ -56,10 +62,50 @@ def _is_int(x: Any) -> bool:
     return isinstance(x, int) and not isinstance(x, bool)
 
 
+def _coerce_int(value: Any) -> Optional[int]:
+    """把 JSON 值归一化为任意精度整数；非整数字面量返回 None。
+
+    接受真正的 int（bool 除外）以及严格十进制整数字符串
+    （页面为绕过 JS Number 精度限制而以字符串上送的大整数）。
+    浮点数、科学计数法、布尔等一律拒绝，由调用方报字段错误。
+    """
+    if _is_int(value):
+        return value
+    if isinstance(value, str) and _INT_LITERAL_RE.match(value.strip()):
+        return int(value, 10)
+    return None
+
+
+def normalize_for_fingerprint(value: Any) -> Any:
+    """递归归一化载荷，使数值等价写法（123 与 "123"）产生同一指纹。
+
+    同时作为严格的 JSON 形状校验：仅 dict/list/str/int/float/bool/None。
+    严格十进制整数字符串归一化为 int；其余字符串（含带空白、科学计数法）
+    保留原样，不与数值等价，避免 " 123" 之类混入数值通道。
+    """
+    if isinstance(value, bool) or value is None:
+        return value
+    if _is_int(value):
+        return value
+    if isinstance(value, str):
+        if _INT_LITERAL_RE.match(value):
+            return int(value, 10)
+        return value
+    if isinstance(value, dict):
+        return {k: normalize_for_fingerprint(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [normalize_for_fingerprint(v) for v in value]
+    if isinstance(value, float):
+        return value
+    raise TypeError(f"不支持的载荷类型: {type(value).__name__}")
+
+
 def _require_int(value: Any, loc: str) -> int:
-    if not _is_int(value):
-        raise ValidationError("必须为整数（不接受浮点数/布尔值/字符串）", loc)
-    return value
+    iv = _coerce_int(value)
+    if iv is None:
+        raise ValidationError(
+            "必须为整数（不接受浮点数/布尔值/科学计数法/非数字字符串）", loc)
+    return iv
 
 
 def parse_and_validate(payload: Any) -> Problem:
@@ -156,8 +202,8 @@ def parse_and_validate(payload: Any) -> Problem:
             raise ValidationError(f"上界 hi({hi}) 必须 >= 下界 lo({lo})", f"{loc}.hi")
         if hi > 10 ** 18:
             raise ValidationError("上界 hi 过大（上限 1e18）", f"{loc}.hi")
-        if abs(cost) > 10 ** 12:
-            raise ValidationError("单位成本绝对值过大（上限 1e12）", f"{loc}.cost")
+        if abs(cost) > 10 ** 18:
+            raise ValidationError("单位成本绝对值过大（上限 1e18）", f"{loc}.cost")
 
         edges.append(Edge(eid, index[frm], index[to], lo, hi, cost))
 

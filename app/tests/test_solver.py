@@ -15,6 +15,7 @@ from solver import (  # noqa: E402
     solve,
     solve_payload,
 )
+from audit import fingerprint  # noqa: E402
 
 
 def mk(stations, pipes):
@@ -156,6 +157,56 @@ class TestBasic(unittest.TestCase):
         cost = verify_solution(res, prob)
         self.assertEqual(cost, big * 10 ** 6)  # 10^24，远超浮点安全整数
         self.assertIsInstance(cost, int)
+
+    def test_huge_quantities_unit_costs_exact(self):
+        # 供需/界 10^18，单位成本 10^12，总成本 10^30 量级
+        big = 10 ** 18
+        c = 10 ** 12
+        payload = mk([("S", big), ("M", 0), ("T", -big)],
+                     [("S", "M", big // 3, big, c),
+                      ("M", "T", 0, big, c + 2),
+                      ("S", "T", 0, big, 2 * c + 10)])
+        res = solve_payload(payload)
+        prob = parse_and_validate(payload)
+        cost = verify_solution(res, prob)
+        self.assertIsInstance(cost, int)
+        self.assertGreater(cost, 10 ** 29)
+        f = {x["id"]: x["flow"] for x in res["flows"]}
+        # 经 M 单价 2c+2 < direct 2c+10，故全部走经 M 的路径
+        self.assertEqual(f["e0"], big)
+        self.assertEqual(f["e1"], big)
+        self.assertEqual(f["e2"], 0)
+        self.assertEqual(cost, big * (2 * c + 2))
+
+    def test_integer_string_accepted_losslessly(self):
+        # 页面对超出安全整数范围的值以严格十进制字符串上送
+        big = 10 ** 18
+        payload = {
+            "stations": [{"id": "S", "balance": str(big)},
+                         {"id": "T", "balance": f"-{big}"}],
+            "pipes": [{"id": "e0", "from": "S", "to": "T",
+                       "lo": "0", "hi": str(big), "cost": "1000000"}]}
+        res = solve_payload(payload)
+        prob = parse_and_validate(payload)
+        self.assertEqual(prob.balance[0], big)
+        self.assertEqual(prob.edges[0].hi, big)
+        cost = verify_solution(res, prob)
+        self.assertEqual(cost, big * 10 ** 6)
+
+    def test_numeric_equivalent_payloads_same_fingerprint(self):
+        self.assertEqual(
+            fingerprint({"stations": [{"balance": 10 ** 18}], "x": [1, "2"]}),
+            fingerprint({"stations": [{"balance": str(10 ** 18)}],
+                         "x": ["1", 2]}))
+        # 非数字字符串/科学计数法不得被当作整数归一化
+        self.assertEqual(
+            fingerprint({"a": "1"}), fingerprint({"a": "01"}))  # 数值都为 1
+        self.assertNotEqual(
+            fingerprint({"a": "1e3"}), fingerprint({"a": "1000"}))
+        self.assertNotEqual(
+            fingerprint({"a": "1"}), fingerprint({"a": "1 "}))
+        # 注意：_coerce_int 容忍首尾空白，但指纹规范化不容忍空白，
+        # 从而仅"严格十进制"写法参与等价；这里 1 与 "1 "（带空格）不等价。
 
 
 class TestInfeasible(unittest.TestCase):
