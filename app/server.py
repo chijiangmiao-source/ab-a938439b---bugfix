@@ -16,6 +16,7 @@ import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
+import bigjson
 from audit import AuditError, AuditStore
 from solver import ValidationError, solve_payload
 
@@ -64,8 +65,8 @@ class Handler(BaseHTTPRequestHandler):
             length = 0
         raw = self.rfile.read(length) if length > 0 else b""
         try:
-            return json.loads(raw.decode("utf-8")) if raw else None
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            return bigjson.loads(raw.decode("utf-8")) if raw else None
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
             self._send_json(
                 {"error": f"请求体不是合法 JSON: {exc}", "loc": "$"}, 400)
             return _MISSING

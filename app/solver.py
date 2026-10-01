@@ -16,12 +16,19 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 MAX_STATIONS = 12
 MAX_PIPES = 36
+MAX_FIELD_MAGNITUDE = 10 ** 18  # 供需/上下界/单位成本允许的系统上限
 INF = 10 ** 30  # 仅作哨兵，绝不进入结果
+
+# 页面在数值超出 JS 安全整数范围时，会以十进制 *字符串* 形式承载整数
+# （JS 的 JSON 无法无损表达 >2^53 的数）。这类字符串与整数字面量数值等价，
+# 予以接受；浮点记法（"1.0"/"1e3"）、布尔等一律拒绝。
+_EXACT_INT_TEXT = re.compile(r"^[+-]?\d+$")
 
 
 class ValidationError(Exception):
@@ -57,9 +64,55 @@ def _is_int(x: Any) -> bool:
 
 
 def _require_int(value: Any, loc: str) -> int:
-    if not _is_int(value):
-        raise ValidationError("必须为整数（不接受浮点数/布尔值/字符串）", loc)
-    return value
+    """返回精确整数；拒绝浮点数/布尔/字符串浮点记法。
+
+    接受 Python int，以及与整数数值等价的十进制字符串（页面在整数超过
+    JS Number 安全范围时只能以字符串承载）。
+    """
+    if _is_int(value):
+        return value
+    if isinstance(value, str) and _EXACT_INT_TEXT.match(value.strip()):
+        return int(value.strip())
+    raise ValidationError("必须为整数（不接受浮点数/布尔值/字符串）", loc)
+
+
+def canonicalize_payload(payload: Any) -> Any:
+    """深拷贝载荷，把数值字段上与整数等价的字符串归一为 int。
+
+    同一审计标识以数值等价方式重传（10**18 写成 1000000000000000000、
+    "+1000000000000000000" 或 "0001..."）时，规范化后指纹一致，稳定取回
+    原记录。非数值字段（站点/管路 id、from/to、audit_id 等）保持原样，
+    非法输入不会走到指纹比较（先经字段校验）。
+    """
+    if not isinstance(payload, dict):
+        return payload
+
+    def norm_station(st: Any) -> Any:
+        if not isinstance(st, dict):
+            return st
+        out = dict(st)
+        for key in ("balance", "supply", "demand"):
+            v = out.get(key)
+            if isinstance(v, str) and _EXACT_INT_TEXT.match(v.strip()):
+                out[key] = int(v.strip())
+        return out
+
+    def norm_pipe(p: Any) -> Any:
+        if not isinstance(p, dict):
+            return p
+        out = dict(p)
+        for key in ("lo", "hi", "cost"):
+            v = out.get(key)
+            if isinstance(v, str) and _EXACT_INT_TEXT.match(v.strip()):
+                out[key] = int(v.strip())
+        return out
+
+    result = dict(payload)
+    if isinstance(result.get("stations"), list):
+        result["stations"] = [norm_station(s) for s in result["stations"]]
+    if isinstance(result.get("pipes"), list):
+        result["pipes"] = [norm_pipe(p) for p in result["pipes"]]
+    return result
 
 
 def parse_and_validate(payload: Any) -> Problem:
@@ -107,8 +160,9 @@ def parse_and_validate(payload: Any) -> Problem:
                 raise ValidationError("同一站点 supply 与 demand 不能同时为正", loc)
             b = s - d
         balance.append(b)
-        if abs(b) > 10 ** 18:
-            raise ValidationError("供需绝对值过大（上限 1e18）", loc)
+        if abs(b) > MAX_FIELD_MAGNITUDE:
+            raise ValidationError(
+                f"供需绝对值过大（上限 {MAX_FIELD_MAGNITUDE}）", loc)
 
     total_supply = sum(b for b in balance if b > 0)
     total_demand = sum(-b for b in balance if b < 0)
@@ -154,10 +208,13 @@ def parse_and_validate(payload: Any) -> Problem:
             raise ValidationError("下界 lo 必须 >= 0", f"{loc}.lo")
         if hi < lo:
             raise ValidationError(f"上界 hi({hi}) 必须 >= 下界 lo({lo})", f"{loc}.hi")
-        if hi > 10 ** 18:
-            raise ValidationError("上界 hi 过大（上限 1e18）", f"{loc}.hi")
-        if abs(cost) > 10 ** 12:
-            raise ValidationError("单位成本绝对值过大（上限 1e12）", f"{loc}.cost")
+        if hi > MAX_FIELD_MAGNITUDE:
+            raise ValidationError(
+                f"上界 hi 过大（上限 {MAX_FIELD_MAGNITUDE}）", f"{loc}.hi")
+        if abs(cost) > MAX_FIELD_MAGNITUDE:
+            raise ValidationError(
+                f"单位成本绝对值过大（上限 {MAX_FIELD_MAGNITUDE}）",
+                f"{loc}.cost")
 
         edges.append(Edge(eid, index[frm], index[to], lo, hi, cost))
 

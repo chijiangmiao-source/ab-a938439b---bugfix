@@ -4,6 +4,113 @@ const MAX_STATIONS = 12;
 const MAX_PIPES = 36;
 const MAX_SAFE_WIRE_INTEGER = BigInt(Number.MAX_SAFE_INTEGER);
 
+// ------------------------------------------------------------ 无损 JSON 解析
+// 服务端返回的总成本/流量/费用贡献/势/约化成本可能超过 2^53（如 10^30）。
+// Response.json() 会把它们走 Number 造成精度丢失，这里自行实现一个与
+// JSON 等价的解析器：整数字面量一律得到 BigInt，浮点字面量才得到 Number。
+function parseJsonExact(text) {
+  let i = 0;
+  const n = text.length;
+
+  function skipWs() {
+    while (i < n) {
+      const c = text.charCodeAt(i);
+      if (c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d) i++;
+      else break;
+    }
+  }
+
+  function readString() {
+    i++; // 开引号
+    let out = "";
+    while (i < n) {
+      const c = text[i++];
+      if (c === '"') return out;
+      if (c === "\\") {
+        const e = text[i++];
+        if (e === "u") {
+          const hex = text.slice(i, i + 4);
+          i += 4;
+          out += String.fromCharCode(parseInt(hex, 16));
+        } else {
+          out += { '"': '"', "\\": "\\", "/": "/", b: "\b",
+                   f: "\f", n: "\n", r: "\r", t: "\t" }[e];
+        }
+      } else {
+        out += c;
+      }
+    }
+    throw new Error("JSON 字符串未闭合");
+  }
+
+  function readNumber() {
+    const start = i;
+    if (text[i] === "-") i++;
+    const digitStart = i;
+    while (i < n && text[i] >= "0" && text[i] <= "9") i++;
+    if (i === digitStart) throw new Error("JSON 数字缺少整数部分");
+    let isFloat = false;
+    if (text[i] === ".") {
+      isFloat = true; i++;
+      const fracStart = i;
+      while (i < n && text[i] >= "0" && text[i] <= "9") i++;
+      if (i === fracStart) throw new Error("JSON 数字小数部分缺少数字");
+    }
+    if (text[i] === "e" || text[i] === "E") {
+      isFloat = true; i++;
+      if (text[i] === "+" || text[i] === "-") i++;
+      const expStart = i;
+      while (i < n && text[i] >= "0" && text[i] <= "9") i++;
+      if (i === expStart) throw new Error("JSON 数字指数部分缺少数字");
+    }
+    const lexeme = text.slice(start, i);
+    return isFloat ? Number(lexeme) : BigInt(lexeme);
+  }
+
+  function readValue() {
+    skipWs();
+    const c = text[i];
+    if (c === '"') return readString();
+    if (c === "{") {
+      i++; skipWs();
+      const obj = {};
+      if (text[i] === "}") { i++; return obj; }
+      while (true) {
+        skipWs();
+        const key = readString();
+        skipWs();
+        if (text[i++] !== ":") throw new Error("JSON 缺少冒号");
+        obj[key] = readValue();
+        skipWs();
+        if (text[i] === ",") { i++; continue; }
+        if (text[i] === "}") { i++; return obj; }
+        throw new Error("JSON 对象结构非法");
+      }
+    }
+    if (c === "[") {
+      i++; skipWs();
+      const arr = [];
+      if (text[i] === "]") { i++; return arr; }
+      while (true) {
+        arr.push(readValue());
+        skipWs();
+        if (text[i] === ",") { i++; continue; }
+        if (text[i] === "]") { i++; return arr; }
+        throw new Error("JSON 数组结构非法");
+      }
+    }
+    if (text.startsWith("true", i)) { i += 4; return true; }
+    if (text.startsWith("false", i)) { i += 5; return false; }
+    if (text.startsWith("null", i)) { i += 4; return null; }
+    return readNumber();
+  }
+
+  const value = readValue();
+  skipWs();
+  if (i !== n) throw new Error("JSON 尾部有多余字符");
+  return value;
+}
+
 const stationBody = document.querySelector("#stationTable tbody");
 const pipeBody = document.querySelector("#pipeTable tbody");
 const counter = document.querySelector("#counter");
@@ -141,16 +248,24 @@ function buildPayload() {
 }
 
 // ------------------------------------------------------------ 渲染结果
-function rcClass(rc) { return rc < 0 ? "rc-neg" : rc === 0 ? "rc-zero" : "rc-pos"; }
+// 响应中的整数解析为 BigInt：DOM 文本可直接赋值，但模板字符串/字符串拼接
+// 不接受 BigInt，统一经 fmt 转十进制字符串（无损，不用 Number）。
+function fmt(v) {
+  return typeof v === "bigint" ? v.toString() : String(v);
+}
+
+function rcClass(rc) {
+  return rc < 0 ? "rc-neg" : rc == 0 ? "rc-zero" : "rc-pos";
+}
 
 function renderOptimal(r) {
   const boxes = el("div", { class: "kv" },
     el("div", { class: "box" },
       el("div", { class: "label", text: "总成本" }),
-      el("div", { class: "value", text: r.total_cost })),
+      el("div", { class: "value mono", text: fmt(r.total_cost) })),
     el("div", { class: "box" },
       el("div", { class: "label", text: "消除的负环数" }),
-      el("div", { class: "value", text: r.cycles_cancelled })),
+      el("div", { class: "value", text: fmt(r.cycles_cancelled) })),
     el("div", { class: "box" },
       el("div", { class: "label", text: "算法" }),
       el("div", { style: "font-size:12px", text: r.algorithm })),
@@ -159,7 +274,7 @@ function renderOptimal(r) {
 
   const potRows = Object.entries(r.potentials)
     .map(([s, p]) => el("tr", {},
-      el("td", { text: s }), el("td", { class: "mono", text: p })));
+      el("td", { text: s }), el("td", { class: "mono", text: fmt(p) })));
   resultBody.appendChild(el("h3", { text: "站点势 π（正残量边 c + π[u] − π[v] ≥ 0）" }));
   resultBody.appendChild(el("div", { class: "table-wrap" },
     el("table", { class: "result mono" },
@@ -169,14 +284,15 @@ function renderOptimal(r) {
 
   const rows = r.edges.map(e => {
     const rcs = e.residual.map(x =>
-      `${x.direction === "forward" ? "正向" : "反向"} 容${x.capacity} ` +
-      `<span class="${rcClass(x.reduced_cost)}">c*=${x.reduced_cost}</span>`);
+      `${x.direction === "forward" ? "正向" : "反向"} 容${fmt(x.capacity)} ` +
+      `<span class="${rcClass(x.reduced_cost)}">c*=${fmt(x.reduced_cost)}</span>`);
     return el("tr", {},
       el("td", { class: "mono", text: e.id }),
       el("td", { text: `${e.from} → ${e.to}` }),
-      el("td", { class: "mono", text: `${e.flow} ∈ [${e.lo}, ${e.hi}]` }),
-      el("td", { class: "mono", text: e.cost }),
-      el("td", { class: "mono", text: e.cost_contribution }),
+      el("td", { class: "mono",
+        text: `${fmt(e.flow)} ∈ [${fmt(e.lo)}, ${fmt(e.hi)}]` }),
+      el("td", { class: "mono", text: fmt(e.cost) }),
+      el("td", { class: "mono", text: fmt(e.cost_contribution) }),
       el("td", { html: rcs.join("<br>") || "无正残量弧" }));
   });
   resultBody.appendChild(el("h3", { text: "逐边流量与残量约化成本（复算证据）" }));
@@ -190,10 +306,10 @@ function renderOptimal(r) {
 
   const nrows = r.node_check.map(n => el("tr", {},
     el("td", { text: n.station }),
-    el("td", { class: "mono", text: n.inflow }),
-    el("td", { class: "mono", text: n.outflow }),
-    el("td", { class: "mono", text: n.net_out }),
-    el("td", { class: "mono", text: n.balance }),
+    el("td", { class: "mono", text: fmt(n.inflow) }),
+    el("td", { class: "mono", text: fmt(n.outflow) }),
+    el("td", { class: "mono", text: fmt(n.net_out) }),
+    el("td", { class: "mono", text: fmt(n.balance) }),
     el("td", { class: n.ok ? "ok mono" : "bad mono", text: n.ok ? "✓" : "✗" })));
   resultBody.appendChild(el("details", { open: "" },
     el("summary", { text: "逐站净供需复算（流出−流入 = balance？）" }),
@@ -212,8 +328,8 @@ function renderInfeasible(r) {
     el("span", { text: r.note })));
   const rows = r.unmet_demand.map(u => el("tr", {},
     el("td", { text: u.station }),
-    el("td", { class: "mono", text: u.required }),
-    el("td", { class: "mono bad", text: u.unsatisfied })));
+    el("td", { class: "mono", text: fmt(u.required) }),
+    el("td", { class: "mono bad", text: fmt(u.unsatisfied) })));
   resultBody.appendChild(el("h3", { text: "未满足需求（超源出边残余）" }));
   resultBody.appendChild(el("div", { class: "table-wrap" },
     el("table", { class: "result" },
@@ -248,7 +364,8 @@ async function submit() {
     const resp = await fetch("/api/solve", {
       method: "POST", headers, body: JSON.stringify(payload),
     });
-    const data = await resp.json();
+    // 不能用 resp.json()：它会把 >2^53 的整数走 Number 而丢精度。
+    const data = parseJsonExact(await resp.text());
     if (resp.status === 400) {
       showResult("invalid", { error: data.error, loc: data.loc });
       return;

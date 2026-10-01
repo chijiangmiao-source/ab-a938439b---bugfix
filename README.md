@@ -7,9 +7,12 @@
 
 ## 算法（`app/solver.py`，全程整数，无浮点、无贪心、不限轮次）
 
-1. **校验**：站点 ≤ 12、管路 ≤ 36；全部字段必须是整数（拒绝浮点数/布尔/字符串）；
-   `lo ≥ 0`、`hi ≥ lo`；总供给必须等于总需求。错误带字段路径定位
-   （如 `pipes[3].hi`）。
+1. **校验**：站点 ≤ 12、管路 ≤ 36；数值字段必须是整数——JSON 整数字面量
+   任意精度直接接受，超过 JS 安全整数范围（2^53−1）的数也可用**十进制
+   字符串**承载（如 `"1000000000000000000"`，数值等价）；拒绝浮点数、
+   浮点记法字符串（`"1.5"`/`"1e3"`）、布尔、其他字符串；`lo ≥ 0`、
+   `hi ≥ lo`；供需/上下界/单位成本绝对值上限 10^18；总供给必须等于总需求。
+   错误带字段路径定位（如 `pipes[3].hi`）。
 2. **下界消去**：每条边先注入 `lo`，节点余额变为
    `b(v) = balance(v) + Σlo(进入 v) − Σlo(离开 v)`，边剩余容量 `hi−lo`。
 3. **可行流（Dinic 最大流，整数）**：超源向 `b>0` 的点连容量 `b` 的边，
@@ -28,9 +31,24 @@
 
 - 请求带头 `X-Audit-Id: <标识>`（或在 JSON 中放 `audit_id`）。
 - **同标识 + 同载荷**重传：不重新求解，直接返回首次原记录（`replayed: true`）。
+  载荷比较按**数值等价**归一：大整数写成 JSON 数字 token 或十进制字符串
+  （含 `+` 号、前导零）视为同一载荷。
 - **同标识 + 改载荷**：HTTP 409 拒绝，并回显已存载荷指纹。
 - 载荷指纹为规范化 JSON（排序键）的 SHA-256；记录落盘 `/data/audit.json`，
   服务/容器重启后仍可重放与查询（`GET /api/records/<id>`）。
+
+## 大整数无损链路（供需/界/成本可达 10^18，总成本可达 10^36）
+
+- **页面录入**：输入框按十进制文本解析为 `BigInt`；超过 `Number.MAX_SAFE_INTEGER`
+  的数以**字符串**放入请求体，其余以 JSON 数字发送（见 `static/app.js`）。
+- **接口传输**：服务端用 `app/bigjson.py`（`parse_int=int`）解析，整数字面量
+  保持 Python 任意精度 `int`，绝不经过 float；响应中 `json.dumps` 输出完整
+  十进制整数。
+- **返回复算**：页面以自带的无损解析器（整数→`BigInt`，浮点→`Number`）读取
+  响应，`total_cost`、逐边 `cost_contribution`、`flows`、`potentials` 与
+  `residual[].reduced_cost` 全部逐位保留，可直接复算净流出、费用贡献与
+  约化成本。
+- 审计库同样以 `bigjson` 读回，重启后超大整数记录无损。
 
 ## 运行（Docker Compose，需 Docker + Compose v2）
 
@@ -62,7 +80,7 @@ echo $?                        # 0 = 全部通过
 
 ```bash
 cd app
-python3 -m unittest discover -s tests -v      # 23 项测试
+python3 -m unittest discover -s tests -v      # 38 项测试
 PORT=8080 AUDIT_DB=/tmp/audit.json python3 server.py
 python3 tests/smoke.py http://localhost:8080  # API 冒烟
 ```

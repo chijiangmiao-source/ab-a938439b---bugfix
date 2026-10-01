@@ -15,11 +15,20 @@ import os
 import threading
 from typing import Any, Dict, Optional
 
+import bigjson
+from solver import canonicalize_payload
+
+# 保留 v1 前缀（首字符为 U+FEFF BOM）：对任何旧版可成功落盘的载荷（数值
+# 字段只能是整数 token，旧校验拒绝数字字符串），canonicalize_payload 是
+# 恒等变换，故指纹字节不变，已有审计记录仍可正常重放。
 _FP_PREFIX = "﻿fp-v1"  # 防止 {"a":1} 与 {"a":"1"} 之类的键序碰撞
 
 
 def fingerprint(payload: Any) -> str:
-    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+    # 先把数值等价的整数字符串归一为 int，使 10**18 的两种承载方式
+    # （JSON 大整数 token / 十进制字符串）得到同一指纹。
+    canonical = json.dumps(canonicalize_payload(payload),
+                           ensure_ascii=False, sort_keys=True,
                            separators=(",", ":"))
     return hashlib.sha256((_FP_PREFIX + canonical).encode("utf-8")).hexdigest()
 
@@ -39,10 +48,10 @@ class AuditStore:
         if os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+                    data = bigjson.load(f)
                 if isinstance(data, dict):
                     self._records = data
-            except (json.JSONDecodeError, OSError):
+            except (json.JSONDecodeError, OSError, ValueError):
                 self._records = {}
 
     def _flush_locked(self) -> None:

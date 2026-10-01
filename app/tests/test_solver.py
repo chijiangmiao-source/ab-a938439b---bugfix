@@ -158,6 +158,94 @@ class TestBasic(unittest.TestCase):
         self.assertIsInstance(cost, int)
 
 
+class TestLargeIntegers(unittest.TestCase):
+    """超过前端 Number.MAX_SAFE_INTEGER(2^53-1) 的合法液路，全程精确复算。"""
+
+    BIG = 10 ** 18
+
+    def _check(self, payload, expected_cost):
+        res = solve_payload(payload)
+        self.assertEqual(res["status"], "optimal")
+        prob = parse_and_validate(payload)
+        cost = verify_solution(res, prob)  # 界/平衡/费用/约化成本全部独立复算
+        self.assertIsInstance(cost, int)
+        self.assertEqual(cost, expected_cost)
+        self.assertEqual(res["total_cost"], expected_cost)
+        return res
+
+    def test_1e18_flow_1e18_cost_gives_1e36(self):
+        big = self.BIG
+        payload = mk([("S", big), ("T", -big)],
+                     [("S", "T", 0, big, big)])
+        self._check(payload, big * big)  # 10^36
+
+    def test_cheap_capacity_split_at_1e18_scale(self):
+        big = self.BIG
+        half = big // 2
+        payload = mk([("S", big), ("T", -big)],
+                     [("S", "T", 0, half, 3),
+                      ("S", "T", 0, big, big)])
+        res = self._check(payload, half * 3 + (big - half) * big)
+        flows = {f["id"]: f["flow"] for f in res["flows"]}
+        self.assertEqual(flows["e0"], half)
+        self.assertEqual(flows["e1"], big - half)
+
+    def test_lower_bound_force_flow_at_1e18(self):
+        big = self.BIG
+        # 贵管下界 4e17 强制承载，剩余走便宜管
+        forced = 4 * 10 ** 17
+        payload = mk([("S", big), ("T", -big)],
+                     [("S", "T", forced, big, 10 ** 9),
+                      ("S", "T", 0, big, 1)])
+        self._check(payload, forced * 10 ** 9 + (big - forced) * 1)
+
+    def test_decimal_strings_numerically_equivalent(self):
+        # 页面对 >2^53 的整数以十进制字符串承载，必须按数值接受并得到同一解
+        big = self.BIG
+        payload = {
+            "stations": [{"id": "S", "balance": f"+{big}"},
+                         {"id": "T", "balance": f"-000{big}"}],
+            "pipes": [{"id": "p", "from": "S", "to": "T",
+                       "lo": "0000", "hi": str(big), "cost": "2"}],
+        }
+        res = self._check(payload, big * 2)
+        prob = parse_and_validate(payload)
+        self.assertEqual(prob.balance, [big, -big])
+        self.assertEqual(prob.edges[0].hi, big)
+
+    def test_string_float_notation_rejected(self):
+        for bad in ["1.5", "1e3", "2.0"]:
+            payload = {"stations": [{"id": "S", "balance": bad},
+                                    {"id": "T", "balance": -1}], "pipes": []}
+            with self.assertRaises(ValidationError) as ctx:
+                parse_and_validate(payload)
+            self.assertEqual(ctx.exception.loc, "stations[0].balance")
+
+    def test_numeric_equivalence_canonicalizes(self):
+        from solver import canonicalize_payload
+        big = self.BIG
+        a = {"stations": [{"id": "S", "balance": big},
+                          {"id": "T", "balance": -big}],
+             "pipes": [{"id": "p", "from": "S", "to": "T",
+                        "lo": 0, "hi": big, "cost": 7}]}
+        b = {"stations": [{"id": "S", "balance": str(big)},
+                          {"id": "T", "balance": f"-{big}"}],
+             "pipes": [{"id": "p", "from": "S", "to": "T",
+                        "lo": "0", "hi": f"00{big}", "cost": "7"}]}
+        self.assertEqual(canonicalize_payload(b), a)
+
+    def test_unit_cost_allowed_up_to_1e18(self):
+        big = self.BIG
+        payload = mk([("S", 1), ("T", -1)],
+                     [("S", "T", 0, 1, big)])
+        self._check(payload, big)
+        too_big = mk([("S", 1), ("T", -1)],
+                     [("S", "T", 0, 1, big + 1)])
+        with self.assertRaises(ValidationError) as ctx:
+            parse_and_validate(too_big)
+        self.assertEqual(ctx.exception.loc, "pipes[0].cost")
+
+
 class TestInfeasible(unittest.TestCase):
     def test_infeasible_cut_evidence(self):
         # T 需求 5，但唯一进入 T 的边容量 2
